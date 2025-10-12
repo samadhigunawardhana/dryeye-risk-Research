@@ -1,0 +1,31 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Jupyter/plots/temp
+.ipynb_checkpoints/
+*.png~
+*.tmp
+*.log
+
+# Large local data (keep only 1 small demo if needed)
+recordings/*
+!recordings/test1.mp4
+!recordings/test2.mp4
+!recordings/test3.mp4
+
+# Model artifacts (keep the final ones; ignore experiments)
+# If you only want the final to be tracked, comment these lines.
+# *.joblib
+
+# Streamlit
+.streamlit/

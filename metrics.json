@@ -1,0 +1,57 @@
+{
+  "selected_model": "rf",
+  "cv_strategy": "Stratified 5-fold + 70/30 holdout",
+  "cv_summary": {
+    "cv_f1_macro": 0.8200173492506231,
+    "best_params": {
+      "max_depth": 6,
+      "min_samples_split": 2,
+      "n_estimators": 600
+    }
+  },
+  "holdout_accuracy": 0.8444444444444444,
+  "classification_report": {
+    "High": {
+      "precision": 0.95,
+      "recall": 0.8444444444444444,
+      "f1-score": 0.8941176470588236,
+      "support": 45.0
+    },
+    "Low": {
+      "precision": 0.851063829787234,
+      "recall": 0.8888888888888888,
+      "f1-score": 0.8695652173913043,
+      "support": 45.0
+    },
+    "Medium": {
+      "precision": 0.75,
+      "recall": 0.8,
+      "f1-score": 0.7741935483870968,
+      "support": 45.0
+    },
+    "accuracy": 0.8444444444444444,
+    "macro avg": {
+      "precision": 0.8503546099290781,
+      "recall": 0.8444444444444444,
+      "f1-score": 0.8459588042790749,
+      "support": 135.0
+    },
+    "weighted avg": {
+      "precision": 0.850354609929078,
+      "recall": 0.8444444444444444,
+      "f1-score": 0.845958804279075,
+      "support": 135.0
+    }
+  },
+  "class_counts": {
+    "Low": 150,
+    "Medium": 150,
+    "High": 150
+  },
+  "feature_cols": [
+    "blink_rate_bpm",
+    "incomplete_blink_ratio",
+    "avg_ibi_sec",
+    "redness_index"
+  ]
+}
