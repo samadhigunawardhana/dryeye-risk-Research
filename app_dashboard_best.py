@@ -1,11 +1,11 @@
 # app_dashboard_best.py
 """
 Dashboard without webcam (stable everywhere).
-Now includes a 7-item OSDI questionnaire:
+Now uses a 5-feature model: 4 video features + OSDI score.
 OSDI Score = (sum of responses × 25) / number answered
 """
 
-from typing import Optional
+from typing import Optional, Dict
 import json, tempfile, importlib
 from pathlib import Path
 
@@ -14,10 +14,18 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-FEATURE_COLS = ["blink_rate_bpm","incomplete_blink_ratio","avg_ibi_sec","redness_index"]
+# ===== IMPORTANT: model expects 5 features (video + OSDI) =====
+FEATURE_COLS = [
+    "blink_rate_bpm",
+    "incomplete_blink_ratio",
+    "avg_ibi_sec",
+    "redness_index",
+    "osdi_score",
+]
+VIDEO_FEATURES = FEATURE_COLS[:-1]  # first 4
 
 st.set_page_config(page_title="Dry Eye Risk – Dashboard (Best)", layout="centered")
-st.title("Dry Eye Risk (Blink + Redness) – Dashboard (Best)")
+st.title("Dry Eye Risk (Blink + Redness + OSDI) – Dashboard (Best)")
 
 # ---------------- OSDI helpers ----------------
 QUESTIONS = [
@@ -32,23 +40,21 @@ QUESTIONS = [
 CHOICES = [0, 1, 2, 3, 4]  # 0=Never ... 4=Always
 
 def compute_osdi(responses: list[int]) -> float:
-    # official scoring: (sum of answered * 25) / number answered
     answered = [v for v in responses if v is not None]
     if not answered:
         return 0.0
     return round((sum(answered) * 25.0) / len(answered), 1)
 
-def osdi_form():
+def osdi_form() -> Optional[float]:
     st.subheader("OSDI – Quick Symptoms Questionnaire")
     st.caption("Scale: 0 = Never … 4 = Always")
     with st.form("osdi_form"):
-        cols = st.columns(1)
         values = []
         for i, q in enumerate(QUESTIONS):
             values.append(st.radio(
                 f"{i+1}. {q}",
                 options=CHOICES,
-                index=0,  # default 0 = Never
+                index=0,
                 horizontal=True,
                 key=f"osdi_q{i}"
             ))
@@ -56,7 +62,7 @@ def osdi_form():
         score = compute_osdi(values) if submitted else None
     return score
 
-# Persist the last computed OSDI in session
+# Persist last OSDI in session
 if "osdi_score" not in st.session_state:
     st.session_state["osdi_score"] = None
 
@@ -71,27 +77,38 @@ model = joblib.load(model_path)
 label_encoder = joblib.load(label_path)
 st.success("Model loaded.")
 
-def predict_and_show(feats: dict, osdi: Optional[float] = None):
-    x = np.array([[feats["blink_rate_bpm"],
-                   feats["incomplete_blink_ratio"],
-                   feats["avg_ibi_sec"],
-                   feats["redness_index"]]], dtype=float)
+def predict_and_show(video_feats: Dict[str, float], osdi: Optional[float]):
+    # Validate we have OSDI
+    if osdi is None:
+        st.warning("Please compute OSDI first (top of the page). Using 0.0 as a temporary fallback.")
+        osdi = 0.0
+
+    # Compose feature vector in required order
+    x = np.array([[
+        float(video_feats["blink_rate_bpm"]),
+        float(video_feats["incomplete_blink_ratio"]),
+        float(video_feats["avg_ibi_sec"]),
+        float(video_feats["redness_index"]),
+        float(osdi),
+    ]], dtype=float)
+
     y_hat = model.predict(x)[0]
     try:
         label = label_encoder.inverse_transform([y_hat])[0]
     except Exception:
         label = str(y_hat)
-    badge = {"Low":"🟢 Low","Medium":"🟠 Medium","High":"🔴 High"}.get(label, label)
+
+    badge_map = {"Low": "🟢 Low", "Medium": "🟠 Medium", "High": "🔴 High"}
+    badge = badge_map.get(label, label)
 
     st.subheader("Result")
-    c1,c2 = st.columns([2,1])
+    c1, c2 = st.columns([2, 1])
     with c1:
-        st.write(f"**Blink rate:** {feats['blink_rate_bpm']} blinks/min")
-        st.write(f"**Incomplete blink ratio:** {feats['incomplete_blink_ratio']}")
-        st.write(f"**Avg inter-blink interval:** {feats['avg_ibi_sec']} sec")
-        st.write(f"**Redness index:** {feats['redness_index']}")
-        if osdi is not None:
-            st.write(f"**OSDI score:** {osdi}")
+        st.write(f"**Blink rate:** {video_feats['blink_rate_bpm']} blinks/min")
+        st.write(f"**Incomplete blink ratio:** {video_feats['incomplete_blink_ratio']}")
+        st.write(f"**Avg inter-blink interval:** {video_feats['avg_ibi_sec']} sec")
+        st.write(f"**Redness index:** {video_feats['redness_index']}")
+        st.write(f"**OSDI score:** {osdi}")
     with c2:
         st.metric("Predicted Risk", badge)
 
@@ -99,7 +116,7 @@ def predict_and_show(feats: dict, osdi: Optional[float] = None):
 tab1, tab2, tab3 = st.tabs(["🎥 From Video", "📦 From CSV", "🛠 Manual"])
 
 with tab1:
-    # 1) OSDI form at top (recommended flow)
+    # OSDI first
     score = osdi_form()
     if score is not None:
         st.session_state["osdi_score"] = score
@@ -107,8 +124,8 @@ with tab1:
 
     st.subheader("Upload a short eye video")
     st.caption("Use 5–20 s video focused on one eye in good light (mp4/mov/avi).")
+    up = st.file_uploader("Upload video", type=["mp4", "mov", "avi"], key="vid")
 
-    up = st.file_uploader("Upload video", type=["mp4","mov","avi"], key="vid")
     if up:
         tmpdir = tempfile.TemporaryDirectory()
         tmp_path = Path(tmpdir.name) / up.name
@@ -118,19 +135,23 @@ with tab1:
         try:
             extractor = importlib.import_module("extract_features")
         except Exception as e:
-            st.error("Couldn't import extract_features.py. Place it next to this app and define:\n"
-                     "def extract_from_video(video_path)->dict returning the 4 features.\n\n"
-                     f"Error: {e}")
+            st.error(
+                "Couldn't import extract_features.py. Place it next to this app and define:\n"
+                "  def extract_from_video(video_path) -> dict\n"
+                "that returns the 4 video features: "
+                + ", ".join(VIDEO_FEATURES)
+                + f"\n\nError: {e}"
+            )
             st.stop()
 
         if not hasattr(extractor, "extract_from_video"):
-            st.error("Your extract_features.py must define `extract_from_video(video_path)->dict`")
+            st.error("Your extract_features.py must define `extract_from_video(video_path) -> dict`")
             st.stop()
 
         with st.spinner("Extracting features…"):
             feats = extractor.extract_from_video(str(tmp_path))
 
-        missing = [c for c in FEATURE_COLS if c not in feats]
+        missing = [c for c in VIDEO_FEATURES if c not in feats]
         if missing:
             st.error(f"Extractor did not return required keys: {missing}\nReturned: {feats}")
         else:
@@ -141,14 +162,20 @@ with tab1:
 
 with tab2:
     st.subheader("Upload CSV with features")
-    st.caption("CSV must contain: " + ", ".join(FEATURE_COLS) + ". Optional column: osdi_score")
+    st.caption("CSV must contain the 4 video columns; `osdi_score` is optional (falls back to current OSDI).")
     file = st.file_uploader("Upload CSV", type=["csv"], key="csv")
     if file:
         df = pd.read_csv(file)
-        missing = [c for c in FEATURE_COLS if c not in df.columns]
-        if missing:
-            st.error(f"Missing required columns: {missing}")
+        miss_video = [c for c in VIDEO_FEATURES if c not in df.columns]
+        if miss_video:
+            st.error(f"Missing required video columns: {miss_video}")
         else:
+            # If osdi_score not supplied per-row, use session OSDI or 0.0
+            if "osdi_score" not in df.columns:
+                default_osdi = st.session_state.get("osdi_score", 0.0) or 0.0
+                df["osdi_score"] = default_osdi
+                st.info(f"`osdi_score` missing in CSV; using OSDI={default_osdi} for all rows.")
+
             X = df[FEATURE_COLS].astype(float)
             y_hat = model.predict(X)
             try:
@@ -158,25 +185,31 @@ with tab2:
             out = df.copy()
             out["predicted_label"] = labels
             st.dataframe(out.head(25))
-            st.download_button("Download predictions.csv",
-                               out.to_csv(index=False).encode("utf-8"),
-                               "predictions.csv", "text/csv")
+            st.download_button(
+                "Download predictions.csv",
+                out.to_csv(index=False).encode("utf-8"),
+                "predictions.csv",
+                "text/csv",
+            )
 
 with tab3:
     st.subheader("Manual entry (for developers)")
-    c1,c2 = st.columns(2)
+    c1, c2 = st.columns(2)
     with c1:
         br = st.number_input("Blink rate (blinks/min)", 0.0, 60.0, 15.0, 0.1)
         ibi = st.number_input("Avg inter-blink interval (sec)", 0.0, 30.0, 4.5, 0.1)
     with c2:
         inc = st.number_input("Incomplete blink ratio", 0.0, 1.0, 0.12, 0.01, format="%.2f")
         red = st.number_input("Redness index", 0.0, 1.0, 0.22, 0.01, format="%.2f")
-    # Optional: compute OSDI inline here too
-    with st.expander("Optional: OSDI quick compute here"):
-        values = [st.slider(f"{i+1}. {q}", 0, 4, 0) for i, q in enumerate(QUESTIONS)]
-        st.caption("OSDI = (sum × 25) / N")
-        st.write("OSDI score:", compute_osdi(values))
+    osdi_manual = st.number_input("OSDI score", 0.0, 100.0, float(st.session_state.get("osdi_score") or 0.0), 0.1)
+
     if st.button("Predict"):
-        predict_and_show({"blink_rate_bpm": br, "incomplete_blink_ratio": inc,
-                          "avg_ibi_sec": ibi, "redness_index": red},
-                         st.session_state.get("osdi_score"))
+        predict_and_show(
+            {
+                "blink_rate_bpm": br,
+                "incomplete_blink_ratio": inc,
+                "avg_ibi_sec": ibi,
+                "redness_index": red,
+            },
+            osdi_manual,
+        )

@@ -4,6 +4,9 @@ scikit-learn==1.6.1
 joblib==1.4.2
 matplotlib==3.8.4
 streamlit==1.37.1
-opencv-python==4.8.1.78
+opencv-python==4.8.1.78          # or opencv-python-headless==4.8.1.78 on servers
 mediapipe==0.10.14
 protobuf<5
+# Optional, only if WebM decoding gives trouble:
+# imageio-ffmpeg==0.4.9
+# av==12.2.0
