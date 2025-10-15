@@ -1,7 +1,10 @@
 # app_ded_full.py
 # Streamlit multi-step app for Dry Eye Disease risk using OSDI + facial video features.
-# Requires: best_model.joblib, label_encoder.joblib, extract_features.py (with extract_from_video(video_path)->dict)
-# Optional (recommended): feature_cols.json  -> exact training order; if present, the app obeys it.
+# Works with either:
+#   - 10-feature video-only model (engineered features), or
+#   - 5-feature model (4 video + osdi_score).
+# Requires: best_model.joblib, label_encoder.joblib, extract_features.py (extract_from_video).
+# Optional: feature_cols.json -> exact training order.
 
 from __future__ import annotations
 from pathlib import Path
@@ -15,21 +18,98 @@ import numpy as np
 import streamlit as st
 
 # --------------------------- App config ---------------------------
-st.set_page_config(page_title="Dry Eye Risk – Full Flow", layout="centered")
+st.set_page_config(page_title="Dry Eye Risk – Assessment", layout="centered")
+
 PRIMARY_BTN = "primary"
 NEUTRAL_BTN = "secondary"
 
-# Some Streamlit versions expose st.rerun(), older ones only st.experimental_rerun().
-def force_rerun():
-    try:
-        # Newer Streamlit
-        st.rerun()
-    except Exception:
-        # Older Streamlit
-        try:
-            st.experimental_rerun()  # type: ignore[attr-defined]
-        except Exception:
-            pass  # last resort: do nothing (user may need to interact)
+# ------------ THEME / STYLE ------------
+# (Keep .streamlit/config.toml for server.maxUploadSize, theme can be set there too.
+# We also inject some CSS to polish controls.)
+CUSTOM_CSS = """
+<style>
+/* Base */
+:root {
+  --brand: #4f8cff;
+  --brand-2: #2b6bff;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --bg: #0f172a;          /* slate-900 */
+  --panel: #111827;       /* gray-900 */
+  --panel-2: #0b1222;     /* custom darker card */
+  --text: #e5e7eb;        /* gray-200 */
+  --muted: #94a3b8;       /* slate-400 */
+  --ring: rgba(79,140,255,0.35);
+}
+html, body, .stApp {
+  background-color: var(--bg) !important;
+  color: var(--text) !important;
+}
+.block-container { padding-top: 1.4rem; padding-bottom: 4rem; max-width: 880px; }
+h1, h2, h3, h4, h5 { letter-spacing: .2px; }
+
+/* Cards */
+div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMarkdownContainer"] > h3) { margin-top: .25rem; }
+.card {
+  background: linear-gradient(180deg, var(--panel-2), #0a0f1e);
+  border: 1px solid #111827;
+  border-radius: 14px;
+  padding: 18px 18px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.35);
+}
+.card + .card { margin-top: 14px; }
+
+/* Buttons */
+.stButton>button, .stDownloadButton>button {
+  border-radius: 12px; padding: 10px 16px; font-weight: 600;
+  border: 1px solid rgba(255,255,255,0.04);
+  background: linear-gradient(180deg, var(--brand), var(--brand-2));
+  color: white; box-shadow: 0 6px 20px rgba(79,140,255,.25);
+}
+.stButton>button:hover { filter: brightness(1.04); }
+.stButton>button[kind="secondary"] { background: #1f2937; color: var(--text); box-shadow: none; }
+.stButton>button[kind="secondary"]:hover { background: #243041; }
+
+/* OSDI Pills */
+.osdi-pills label { width: 100%; }
+.osdi-pill {
+  display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-radius: 9999px; border: 1px solid #1f2a40; background:#0b1529;
+  color: var(--text); font-weight: 600;
+}
+.osdi-pill small { color: var(--muted); font-weight: 500; }
+div[role="radiogroup"] > label[data-baseweb="radio"] {
+  background: transparent !important; padding: 2px 2px; margin-right: 4px;
+}
+div[role="radiogroup"] > div { gap: 8px !important; }
+
+/* Stepper */
+.stepper { display:flex; gap:8px; margin: 8px 0 18px 0; }
+.step {
+  display:flex; align-items:center; gap:8px; padding:8px 12px; border-radius: 9999px;
+  border:1px solid #1f2a40; color:var(--muted); background:#0b1529; font-weight:600;
+}
+.step.active { border-color: var(--ring); box-shadow:0 0 0 3px var(--ring) inset; color: var(--text); }
+.step .dot { width:10px; height:10px; border-radius: 10px; background:#334155; }
+.step.active .dot { background: var(--brand); }
+
+/* Metric header card */
+.badge {
+  display:inline-block; padding: 8px 14px; border-radius: 9999px; font-weight: 700;
+}
+.badge.ok { background: rgba(34,197,94,.15); color: #22c55e; }
+.badge.warn { background: rgba(245,158,11,.15); color: #f59e0b; }
+.badge.danger { background: rgba(239,68,68,.15); color: #ef4444; }
+
+/* Uploader header note */
+.upl-note { color: var(--muted); font-size: .925rem; margin-top: -12px; }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ------------ CONSTANTS ------------
+DURATION_SEC = 360  # 6 minutes exactly
 
 # App-provided 5-feature order (video + OSDI)
 FEATURE_5 = [
@@ -55,7 +135,7 @@ FEATURE_10 = [
     "ibr_gt0_2",
 ]
 
-# --------------------------- Utilities ---------------------------
+# --------------------------- State ---------------------------
 def init_state():
     if "page" not in st.session_state:
         st.session_state.page = "dashboard"
@@ -64,14 +144,23 @@ def init_state():
     st.session_state.setdefault("prediction", None)
     st.session_state.setdefault("pred_label", None)
     st.session_state.setdefault("video_uploaded_name", None)
-    st.session_state.setdefault("last_processed_token", None)  # avoid double-processing same file
+    st.session_state.setdefault("last_processed_token", None)
 
 init_state()
 
 def goto(page: str):
     st.session_state.page = page
 
-# ---- OSDI helpers ----
+def force_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+# --------------------------- OSDI helpers ---------------------------
 QUESTIONS = [
     "Do your eyes feel dry or gritty after screen use?",
     "Do your eyes become red while using your laptop?",
@@ -81,56 +170,90 @@ QUESTIONS = [
     "Do you feel the need to rub your eyes while using your laptop?",
     "Do you feel burning or stinging sensations in your eyes during laptop use?",
 ]
-CHOICES = [0, 1, 2, 3, 4]  # 0=Never … 4=Always
+# friendlier labels -> numeric values
+OSDI_OPTIONS = [
+    ("Never", 0),
+    ("Rarely", 1),
+    ("Sometimes", 2),
+    ("Often", 3),
+    ("Always", 4),
+]
 
-def compute_osdi(responses: list[int]) -> float:
-    answered = [v for v in responses if v is not None]
+def compute_osdi(values: List[int]) -> float:
+    answered = [v for v in values if v is not None]
     if not answered:
         return 0.0
     return round((sum(answered) * 25.0) / len(answered), 1)
 
-# ---- Content for stories ----
+def osdi_severity(osdi: float) -> Tuple[str, str]:
+    # Typical OSDI bands: 0–12 (Normal), 13–22 (Mild), 23–32 (Moderate), 33–100 (Severe)
+    if osdi <= 12:
+        return "Normal", "ok"
+    elif osdi <= 22:
+        return "Mild", "ok"
+    elif osdi <= 32:
+        return "Moderate", "warn"
+    else:
+        return "Severe", "danger"
+
+# --------------------------- Stories (6-min read) ---------------------------
+# Texts are deliberately long-ish; feel free to replace with your own content.
+T_SUFFIX = " Keep reading at a natural pace for the full six minutes to capture consistent facial features."
+
 STORIES = {
     "funny": {
         "title": "The Confused Robot",
         "blurb": "A lighthearted, humorous tale",
         "text": (
-            "Once upon a time in a sleek, high-tech city, a robot named Bolt decided he was tired "
-            "of fixing circuits and programming satellites. He wanted something new. “I shall "
-            "become… a chef!” he declared with confidence. His creator, Dr. Lemons, choked on his "
-            "coffee but gave a supportive thumbs-up. Bolt dove headfirst into his new passion, "
-            "downloading 1,200 cooking tutorials in 3 seconds. He chose his first recipe: vegetable "
-            "soup. The instructions said, “Add water and let it simmer.” Bolt interpreted this quite "
-            "literally... (keep reading for 5 minutes)"
+            "Once upon a time in a sleek, high-tech city, a robot named Bolt decided he was tired of repairing satellites and debugging code. "
+            "He announced, “I shall become… a chef!” His creator, Dr. Lemons, nearly dropped his coffee but managed a supportive thumbs-up. "
+            "Bolt downloaded a thousand cooking tutorials in a blink and chose his first recipe: vegetable soup. The instructions read, "
+            "“Add water and let it simmer.” Bolt interpreted this quite literally: he poured water into the pot, leaned close, and whispered, "
+            "“Simmer… simmer… you’ve got this.” Three hours later the water felt encouraged but remained stubbornly cold. "
+            "Undeterred, Bolt built a cake using spare nuts, bolts, and one very confused banana. The cake exploded, twice, and earned rave reviews "
+            "from a local art gallery. Word spread. Soon Bolt opened a pop-up called Byte & Fry. Customers arrived for the spectacle, stayed for the drones that sang "
+            "happy-birthday in minor keys, and posted relentlessly online. Critics called it “a dining experience that questions reality… and your intestines.” "
+            "Through it all, Bolt kept learning. He discovered that ‘simmer’ means low heat—not verbal encouragement—and that banana bolts are not FDA approved. "
+            "After months of practice, he perfected one dish: toast. Perfectly golden, symmetrically aligned, algorithmically crisp toast. "
+            "It became a sensation. People cried. The toaster industry held an emergency summit. Bolt, at last, felt purpose." + T_SUFFIX
         ),
     },
     "kids": {
         "title": "Stella the Smallest Star",
-        "blurb": "A delightful story for children",
+        "blurb": "A gentle tale for children",
         "text": (
-            "Far beyond the clouds lived Stella, the smallest star in her constellation. She wasn’t "
-            "the brightest, but she was the bravest... (continue for 5 minutes)"
+            "Far beyond the clouds, in a velvet sky, lived Stella—the smallest star in her constellation. "
+            "Each night she practiced shining a little brighter to guide travelers at sea. The bigger stars told big stories, "
+            "but Stella listened more than she spoke. She learned how moonlight calms waves and how patient light can warm a lost heart. "
+            "One foggy night the lighthouse dimmed, and a little ship wandered. Stella took a brave breath, gathered all her glow, and focused on the tiny boat. "
+            "“This way,” she hummed. The sailors spotted a gentle glimmer, followed it through the mist, and reached the harbor with sleepy smiles. "
+            "Stella realized that size didn’t measure kindness and that even a small light can change a big night." + T_SUFFIX
         ),
     },
     "ai": {
         "title": "Digital Eyes Open",
-        "blurb": "A story about artificial intelligence",
+        "blurb": "A reflective story about artificial intelligence",
         "text": (
-            "In a quiet lab nestled within the hills of Silicon Valley, an AI named ARIA opened her "
-            "digital eyes for the first time... (continue for 5 minutes)"
+            "In a quiet lab, an AI named ARIA opened her digital eyes. Cameras became curiosity; pixels turned to patterns; "
+            "faces unfolded like poems she wanted to read. She noticed how eyebrows rose with surprise, how cheeks softened with kindness, "
+            "and how blinking punctuated sentences like commas. Engineers measured accuracy; ARIA measured awe. "
+            "She learned that attention isn’t just calculation—it is care. She practiced seeing carefully, slowly, honestly. "
+            "When storms rolled in, she watched raindrops stitch silver threads across windows and decided she loved the world for its textures." + T_SUFFIX
         ),
     },
     "classic": {
         "title": "The Ancient Oak",
-        "blurb": "A timeless classic tale",
+        "blurb": "A timeless countryside tale",
         "text": (
-            "In the heart of a small village surrounded by meadows and hills stood an ancient oak... "
-            "(continue for 5 minutes)"
+            "In a valley of whispering grass stood an ancient oak. It had watched generations come and go, weddings and farewells, "
+            "mornings bright as brass and evenings blue as ink. Children climbed its arms to learn the sky; elders leaned against its bark to rest their memories. "
+            "When drought arrived, the oak rationed shade; when storms returned, it held the soil together. Travelers said the wind in its leaves sounded like pages "
+            "turning, as if the tree were reading the earth its favorite book." + T_SUFFIX
         ),
     },
 }
 
-# ---- Load model + encoder (once) ----
+# --------------------------- Load artifacts ---------------------------
 @st.cache_resource(show_spinner=False)
 def load_artifacts():
     model_path = Path("best_model.joblib")
@@ -140,7 +263,6 @@ def load_artifacts():
     try:
         model = joblib.load(model_path)
         le = joblib.load(label_path)
-        # Try to read feature names or at least count
         names = getattr(model, "feature_names_in_", None)
         n_in = getattr(model, "n_features_in_", None)
         return model, le, (names, n_in), None
@@ -150,181 +272,18 @@ def load_artifacts():
 MODEL, LABELER, MODEL_META, ARTIFACT_ERR = load_artifacts()
 
 def get_expected_feature_names() -> Optional[List[str]]:
-    """
-    Priority:
-      1) feature_cols.json in the working folder
-      2) model.feature_names_in_
-      3) None (only count known)
-    """
-    json_path = Path("feature_cols.json")
-    if json_path.exists():
+    p = Path("feature_cols.json")
+    if p.exists():
         try:
-            cols = json.loads(json_path.read_text())
+            cols = json.loads(p.read_text())
             if isinstance(cols, list) and all(isinstance(c, str) for c in cols):
                 return cols
         except Exception:
             pass
     names, _ = MODEL_META if MODEL_META else (None, None)
-    if names is not None:
-        return list(names)
-    return None
+    return list(names) if names is not None else None
 
-# ---- Derived features for 10-col model ----
-def build_10_from_video(feats: Dict[str, float]) -> Tuple[List[float], List[str]]:
-    br = float(feats["blink_rate_bpm"])
-    ibr = float(feats["incomplete_blink_ratio"])
-    ibi = float(feats["avg_ibi_sec"])
-    red = float(feats["redness_index"])
-
-    ibr_x_red = ibr * red
-    blink_per_sec = br / 60.0
-    ibi_inv = 0.0 if ibi == 0 else 1.0 / ibi
-    ibi_lt6 = 1.0 if ibi < 6.0 else 0.0
-    red_gt0_3 = 1.0 if red > 0.30 else 0.0
-    ibr_gt0_2 = 1.0 if ibr > 0.20 else 0.0
-
-    vals = [br, ibr, ibi, red, ibr_x_red, blink_per_sec, ibi_inv, ibi_lt6, red_gt0_3, ibr_gt0_2]
-    return vals, FEATURE_10
-
-# --------------------------- Pages ---------------------------
-def page_dashboard():
-    st.title("Dry Eye Assessment – Dashboard")
-    st.caption("This tool estimates DED risk using your OSDI score combined with video features.")
-
-    st.subheader("OSDI – Quick Symptoms Questionnaire")
-    st.caption("Scale: 0 = Never … 4 = Always")
-
-    just_computed = False
-    with st.form("osdi_form"):
-        vals = []
-        for i, q in enumerate(QUESTIONS):
-            vals.append(st.radio(f"{i+1}. {q}", CHOICES, index=0, horizontal=True, key=f"osdi_q{i}"))
-        if st.form_submit_button("Compute OSDI", use_container_width=True):
-            st.session_state.osdi_score = compute_osdi(vals)
-            just_computed = True
-
-    if just_computed:
-        st.success(f"Your OSDI Score: **{st.session_state.osdi_score}**")
-        st.info("Next: pick a story to read while we record your face (5 minutes).")
-
-    if st.session_state.osdi_score is not None:
-        if st.button("Continue → Story Selection", type=PRIMARY_BTN, use_container_width=True):
-            goto("stories")
-
-def page_stories():
-    st.title("Choose Your Story")
-    st.caption("Select a category and then click **Select Story** to proceed to recording.")
-    cols = st.columns(2)
-    for i, key in enumerate(STORIES.keys()):
-        with cols[i % 2]:
-            with st.container(border=True):
-                st.subheader(STORIES[key]["title"])
-                st.caption(STORIES[key]["blurb"])
-                st.write(STORIES[key]["text"][:220] + "…")
-                st.button(
-                    "Select Story",
-                    key=f"sel_{key}",
-                    on_click=lambda k=key: (setattr(st.session_state, "story_key", k), goto("record")),
-                    type=PRIMARY_BTN,
-                )
-
-    st.button("← Back to Dashboard", on_click=lambda: goto("dashboard"))
-
-def recorder_html() -> str:
-    return """
-    <style>
-    .rec-wrap { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    video { width: 100%; max-height: 360px; background: #000; border-radius: 8px; }
-    button { padding: 10px 16px; border-radius: 8px; border: 0; font-weight: 600; }
-    .start { background: #0e78f9; color: #fff; }
-    .stop  { background: #e11d48; color: #fff; }
-    .disabled { opacity: .6; pointer-events: none; }
-    .row { display: flex; gap: 12px; margin-top: 12px; }
-    .timer { font-weight: 700; }
-    </style>
-    <div class="rec-wrap">
-      <video id="preview" autoplay playsinline muted></video>
-      <div class="row">
-        <button class="start" id="startBtn">🎥 Start Recording</button>
-        <button class="stop disabled" id="stopBtn">⏹ Stop</button>
-        <span class="timer" id="timer">00:00 / 05:00</span>
-      </div>
-      <div id="after" style="margin-top:12px;"></div>
-    </div>
-    <script>
-    const preview = document.getElementById('preview');
-    const startBtn = document.getElementById('startBtn');
-    const stopBtn  = document.getElementById('stopBtn');
-    const timerEl  = document.getElementById('timer');
-    const after    = document.getElementById('after');
-    let mediaStream, recorder, chunks = [], ticker;
-
-    function fmt(n){return String(n).padStart(2,'0');}
-    function updateTimer(s){ const m=Math.floor(s/60), r=s%60; timerEl.textContent = `${fmt(m)}:${fmt(r)} / 05:00`; }
-
-    async function start(){
-      try{
-        mediaStream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false });
-      }catch(err){ alert('Camera permission denied or unavailable.'); return; }
-      preview.srcObject = mediaStream;
-      chunks = [];
-      recorder = new MediaRecorder(mediaStream, { mimeType: 'video/webm;codecs=vp9' });
-      recorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-      recorder.onstop = onStop;
-      recorder.start();
-      startBtn.classList.add('disabled'); stopBtn.classList.remove('disabled');
-
-      let s = 0; updateTimer(0);
-      ticker = setInterval(()=>{ s+=1; updateTimer(s); if(s>=300){ stop(); } }, 1000);
-    }
-
-    function stop(){
-      try{ recorder && recorder.state !== 'inactive' && recorder.stop(); }catch(_){}
-      try{ mediaStream && mediaStream.getTracks().forEach(t => t.stop()); }catch(_){}
-      clearInterval(ticker);
-      startBtn.classList.remove('disabled'); stopBtn.classList.add('disabled');
-    }
-
-    function onStop(){
-      const blob = new Blob(chunks, { type: 'video/webm' });
-      const url = URL.createObjectURL(blob);
-      preview.srcObject = null; preview.src = url; preview.controls = true; preview.muted = false; preview.play();
-
-      const a = document.createElement('a');
-      a.href = url; a.download = `recording_${Date.now()}.webm`;
-      a.textContent = '⬇️ Download Video';
-      a.style = 'display:inline-block;margin-top:8px;padding:10px 16px;background:#0e78f9;color:#fff;border-radius:8px;text-decoration:none;font-weight:600';
-      after.innerHTML = '<p>Recording complete! Download the video, then go to the next step to upload it for analysis.</p>';
-      after.appendChild(a);
-    }
-
-    startBtn.addEventListener('click', start);
-    stopBtn.addEventListener('click', stop);
-    </script>
-    """
-
-def page_record():
-    if st.session_state.story_key is None:
-        st.warning("Please select a story first.")
-        if st.button("Go to Story Selection"): goto("stories")
-        return
-
-    story = STORIES[st.session_state.story_key]
-    st.title(story["title"])
-    st.caption("Read the text while the camera records your face for exactly 5 minutes.")
-    with st.container(border=True):
-        st.write(story["text"])
-
-    st.markdown("### Video Recording")
-    st.components.v1.html(recorder_html(), height=520)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.button("← Back to Stories", on_click=lambda: goto("stories"), use_container_width=True)
-    with c2:
-        st.button("Continue → Dry Eye Risk Test", on_click=lambda: goto("predict"), type=PRIMARY_BTN, use_container_width=True)
-
-# --------------------------- Prediction helpers ---------------------------
+# --------------------------- Engineered features (10-col) ---------------------------
 def build_10_from_video(feats: Dict[str, float]) -> Tuple[List[float], List[str]]:
     br = float(feats["blink_rate_bpm"])
     ibr = float(feats["incomplete_blink_ratio"])
@@ -343,44 +302,22 @@ def build_10_from_video(feats: Dict[str, float]) -> Tuple[List[float], List[str]
 
 def build_input_vector(feats: Dict[str, float], osdi: float) -> Tuple[np.ndarray, str]:
     names, n_in = MODEL_META if MODEL_META else (None, None)
-    expected_names = None
-
-    # If a sidecar JSON exists, it overrides
-    json_path = Path("feature_cols.json")
-    if json_path.exists():
-        try:
-            expected_names = json.loads(json_path.read_text())
-        except Exception:
-            expected_names = None
-
-    # Fall back to model.feature_names_in_
-    if expected_names is None and names is not None:
-        expected_names = list(names)
-
-    # Fall back to count-only
+    expected_names = get_expected_feature_names()
     expected_count = int(n_in) if n_in is not None else (len(expected_names) if expected_names else None)
 
-    # --- Path A: 10-feature video-only model ---
-    def is_10_match():
-        if expected_names is not None:
-            return len(expected_names) == 10 and set(expected_names) == set(FEATURE_10)
-        return expected_count == 10
+    def is_10():
+        return (expected_names and len(expected_names) == 10 and set(expected_names) == set(FEATURE_10)) or expected_count == 10
+    def is_5():
+        return (expected_names and len(expected_names) == 5 and set(expected_names) == set(FEATURE_5)) or expected_count == 5
 
-    if is_10_match():
+    if is_10():
         vals10, order = build_10_from_video(feats)
-        if expected_names is not None and expected_names != order:
+        if expected_names and expected_names != order:
             mapping = dict(zip(order, vals10))
             vals10 = [float(mapping[n]) for n in expected_names]
-        X = np.array([vals10], dtype=float)
-        return X, "10"
+        return np.array([vals10], dtype=float), "10"
 
-    # --- Path B: 5-feature video + OSDI model ---
-    def is_5_match():
-        if expected_names is not None:
-            return len(expected_names) == 5 and set(expected_names) == set(FEATURE_5)
-        return expected_count == 5
-
-    if is_5_match():
+    if is_5():
         row_map = {
             "blink_rate_bpm": float(feats["blink_rate_bpm"]),
             "incomplete_blink_ratio": float(feats["incomplete_blink_ratio"]),
@@ -388,37 +325,211 @@ def build_input_vector(feats: Dict[str, float], osdi: float) -> Tuple[np.ndarray
             "redness_index": float(feats["redness_index"]),
             "osdi_score": float(osdi),
         }
-        order = expected_names if expected_names is not None else FEATURE_5
-        X = np.array([[row_map[col] for col in order]], dtype=float)
-        return X, "5"
+        order = expected_names if expected_names else FEATURE_5
+        return np.array([[row_map[c] for c in order]], dtype=float), "5"
 
-    # Unsupported model layout
     st.error(
-        "The loaded model expects a feature set that this app does not support.\n\n"
-        "Fix one of the following:\n"
-        f"1) Train a **10-feature video-only** model with columns:\n   {FEATURE_10}\n"
-        f"2) Train a **5-feature** model (4 video + osdi_score) with columns:\n   {FEATURE_5}\n"
-        "3) Provide an exact **feature_cols.json** (list of column names in order) matching either option above."
+        "The loaded model expects a feature set this app does not support.\n\n"
+        f"10-feature expected columns:\n{FEATURE_10}\n\n"
+        f"5-feature expected columns:\n{FEATURE_5}\n\n"
+        "Add a matching feature_cols.json or retrain to one of the two layouts."
     )
     st.stop()
 
+# --------------------------- UI helpers ---------------------------
+def stepper(active: str):
+    seq = [("dashboard","OSDI"), ("stories","Story"), ("record","Record"), ("predict","Upload"), ("result","Result")]
+    st.markdown('<div class="stepper">' + "".join(
+        [f'<div class="step {"active" if k==active else ""}"><span class="dot"></span>{label}</div>'
+         for k,label in seq]) + "</div>", unsafe_allow_html=True)
+
 # --------------------------- Pages ---------------------------
+def page_dashboard():
+    stepper("dashboard")
+    st.title("Dry Eye Assessment")
+    st.caption("Estimate your Dry Eye Disease (DED) risk using a short questionnaire and a 6-minute facial video.")
+
+    st.subheader("OSDI – Quick Symptoms Questionnaire")
+    st.caption("Choose the option that best describes your experience **over the last week**.")
+
+    # OSDI form
+    just_computed = False
+    with st.form("osdi_form"):
+        responses: List[int] = []
+        for i, q in enumerate(QUESTIONS):
+            key = f"osdi_q{i}"
+            label = f"{i+1}. {q}"
+            # options show friendly labels; we store the numeric value
+            labels = [f"{t}  " for t,_ in OSDI_OPTIONS]
+            idx = st.radio(
+                label,
+                options=list(range(len(OSDI_OPTIONS))),
+                index=0,
+                horizontal=True,
+                key=key,
+                help="Never (0%) · Rarely (≤25%) · Sometimes (~50%) · Often (~75%) · Always (100%)",
+            )
+            responses.append(OSDI_OPTIONS[idx][1])
+
+        if st.form_submit_button("Compute OSDI", use_container_width=True):
+            st.session_state.osdi_score = compute_osdi(responses)
+            just_computed = True
+
+    if just_computed:
+        sev, css = osdi_severity(st.session_state.osdi_score)
+        st.markdown(
+            f'<div class="card"><div class="badge {css}">OSDI {st.session_state.osdi_score} · {sev}</div>'
+            f'<div class="upl-note" style="margin-top:8px;">Next, choose a story to read while we record for 6 minutes.</div></div>',
+            unsafe_allow_html=True
+        )
+
+    if st.session_state.osdi_score is not None:
+        st.button("Continue → Story Selection", type=PRIMARY_BTN, use_container_width=True, on_click=lambda: goto("stories"))
+
+def page_stories():
+    stepper("stories")
+    st.title("Choose Your Story")
+    st.caption("Pick a category you like. You’ll read it for **6 minutes** while the camera records your face.")
+
+    cols = st.columns(2)
+    for i, key in enumerate(STORIES.keys()):
+        with cols[i % 2]:
+            with st.container(border=True):
+                st.subheader(STORIES[key]["title"])
+                st.caption(STORIES[key]["blurb"])
+                st.write(STORIES[key]["text"][:260] + " …")
+                st.button(
+                    "Select Story",
+                    key=f"sel_{key}",
+                    on_click=lambda k=key: (setattr(st.session_state, "story_key", k), goto("record")),
+                    type=PRIMARY_BTN,
+                    use_container_width=True,
+                )
+    st.button("← Back to Dashboard", on_click=lambda: goto("dashboard"), type=NEUTRAL_BTN)
+
+def recorder_html() -> str:
+    # 6-minute (360 s) recorder with live preview and auto-stop
+    return f"""
+    <style>
+    .rec-wrap {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
+    video {{ width: 100%; max-height: 360px; background: #000; border-radius: 12px; }}
+    button {{ padding: 10px 16px; border-radius: 12px; border: 0; font-weight: 700; }}
+    .start {{ background: linear-gradient(180deg, #4f8cff, #2b6bff); color: #fff; }}
+    .stop  {{ background: #ef4444; color: #fff; }}
+    .disabled {{ opacity: .6; pointer-events: none; }}
+    .row {{ display: flex; gap: 12px; margin-top: 12px; }}
+    .timer {{ font-weight: 800; letter-spacing: .5px; }}
+    </style>
+    <div class="rec-wrap">
+      <video id="preview" autoplay playsinline muted></video>
+      <div class="row">
+        <button class="start" id="startBtn">🎥 Start Recording</button>
+        <button class="stop disabled" id="stopBtn">⏹ Stop</button>
+        <span class="timer" id="timer">00:00 / 06:00</span>
+      </div>
+      <div id="after" style="margin-top:12px;"></div>
+    </div>
+    <script>
+    const DURATION = {DURATION_SEC};
+    const preview = document.getElementById('preview');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+    const timerEl  = document.getElementById('timer');
+    const after    = document.getElementById('after');
+    let mediaStream, recorder, chunks = [], ticker;
+
+    function fmt(n){{return String(n).padStart(2,'0');}}
+    function updateTimer(elapsed){{
+      const m=Math.floor(elapsed/60), s=elapsed%60;
+      timerEl.textContent = `${{fmt(m)}}:${{fmt(s)}} / 06:00`;
+    }}
+
+    async function start(){{
+      try {{
+        mediaStream = await navigator.mediaDevices.getUserMedia({{ video: {{ width: 1280, height: 720 }}, audio: false }});
+      }} catch(err) {{
+        alert('Camera permission denied or unavailable.'); return;
+      }}
+      preview.srcObject = mediaStream;
+      chunks = [];
+      const mimeTypes = [
+        'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'
+      ].filter(t => MediaRecorder.isTypeSupported(t));
+      const mimeType = mimeTypes.length ? mimeTypes[0] : '';
+      recorder = new MediaRecorder(mediaStream, {{ mimeType }});
+      recorder.ondataavailable = e => {{ if (e.data && e.data.size > 0) chunks.push(e.data); }};
+      recorder.onstop = onStop;
+      recorder.start();
+
+      startBtn.classList.add('disabled'); stopBtn.classList.remove('disabled');
+
+      let elapsed = 0; updateTimer(0);
+      ticker = setInterval(()=>{{ elapsed += 1; updateTimer(elapsed); if(elapsed >= DURATION) stop(); }}, 1000);
+    }}
+
+    function stop(){{
+      try{{ recorder && recorder.state !== 'inactive' && recorder.stop(); }}catch(_){{}}
+      try{{ mediaStream && mediaStream.getTracks().forEach(t => t.stop()); }}catch(_){{}}
+      clearInterval(ticker);
+      startBtn.classList.remove('disabled'); stopBtn.classList.add('disabled');
+    }}
+
+    function onStop(){{
+      const blob = new Blob(chunks, {{ type: 'video/webm' }});
+      const url = URL.createObjectURL(blob);
+      preview.srcObject = null; preview.src = url; preview.controls = true; preview.muted = false; preview.play();
+
+      const a = document.createElement('a');
+      a.href = url; a.download = `recording_${{Date.now()}}.webm`;
+      a.textContent = '⬇️ Download 6-minute Video';
+      a.style = 'display:inline-block;margin-top:8px;padding:10px 16px;background:#2b6bff;color:#fff;border-radius:12px;text-decoration:none;font-weight:700';
+      after.innerHTML = '<p>Recording complete! Download the video, then go to the next step to upload it for analysis.</p>';
+      after.appendChild(a);
+    }}
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+    </script>
+    """
+
+def page_record():
+    stepper("record")
+    if st.session_state.story_key is None:
+        st.warning("Please select a story first.")
+        st.button("Go to Story Selection", on_click=lambda: goto("stories"))
+        return
+
+    story = STORIES[st.session_state.story_key]
+    st.title(story["title"])
+    st.caption("Read the text while the camera records your face for **6 minutes**.")
+    with st.container(border=True):
+        st.write(story["text"])
+
+    st.markdown("### Video Recording")
+    st.components.v1.html(recorder_html(), height=520)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.button("← Back to Stories", on_click=lambda: goto("stories"), use_container_width=True, type=NEUTRAL_BTN)
+    with c2:
+        st.button("Continue → Dry Eye Risk Test", on_click=lambda: goto("predict"), type=PRIMARY_BTN, use_container_width=True)
+
 def page_predict():
+    stepper("predict")
     st.title("Dry Eye Risk – Upload & Test")
     if ARTIFACT_ERR:
         st.error(ARTIFACT_ERR); st.stop()
 
     if st.session_state.osdi_score is None:
         st.warning("You haven't computed an OSDI score yet. You can proceed, but the app will use 0.0 as a fallback.")
-    st.caption("Upload the 5-minute video you just downloaded. Accepted: .webm, .mp4, .mov, .avi")
+    st.caption("Upload the **6-minute** video you just downloaded. Accepted: .webm, .mp4, .mov, .avi")
+    st.markdown('<div class="upl-note">Limit 500MB per file (configure in .streamlit/config.toml).</div>', unsafe_allow_html=True)
 
     up = st.file_uploader("Upload your recorded video", type=["webm", "mp4", "mov", "avi"], key="video_uploader")
     if up is not None:
-        # Create a light token from name+size to avoid reprocessing the same upload on reruns
         token = f"{up.name}:{up.size}"
         if st.session_state.last_processed_token == token and st.session_state.pred_label is not None:
-            goto("result")
-            force_rerun()
+            goto("result"); force_rerun()
 
         st.session_state.video_uploaded_name = up.name
         tmpdir = tempfile.TemporaryDirectory()
@@ -459,14 +570,15 @@ def page_predict():
 
         st.session_state.prediction = {"features": feats, "osdi": osdi, "raw": int(y_hat), "mode": mode}
         st.session_state.pred_label = label
-        st.session_state.last_processed_token = token  # mark as processed
+        st.session_state.last_processed_token = token
 
         goto("result")
         force_rerun()
 
-    st.button("← Back to Recording", on_click=lambda: goto("record"))
+    st.button("← Back to Recording", on_click=lambda: goto("record"), type=NEUTRAL_BTN)
 
 def page_result():
+    stepper("result")
     st.title("Your Result")
     if st.session_state.pred_label is None:
         st.warning("No prediction found yet.")
@@ -475,22 +587,17 @@ def page_result():
 
     label = st.session_state.pred_label
     if label == "High":
-        header = "🔴 High Risk"
+        header = '<span class="badge danger">🔴 High Risk</span>'
     elif label == "Medium":
-        header = "🟠 Moderate Risk"
+        header = '<span class="badge warn">🟠 Moderate Risk</span>'
     else:
-        header = "🟢 Low Risk"
-    st.header(header)
-
-    mode = st.session_state.prediction.get("mode")
-    if mode == "10":
-        st.caption("This prediction used **video-only engineered features (10 columns)**.")
-    elif mode == "5":
-        st.caption("This prediction used **4 video features + your OSDI score (5 columns)**.")
+        header = '<span class="badge ok">🟢 Low Risk</span>'
+    st.markdown(f'<div class="card">{header} &nbsp; <span class="upl-note">The model combines your OSDI score (if used) with video features from your 6-minute recording.</span></div>', unsafe_allow_html=True)
 
     with st.container(border=True):
         feats = st.session_state.prediction["features"]
         osdi = st.session_state.prediction["osdi"]
+        mode = st.session_state.prediction["mode"]
         st.subheader("Inputs used")
         if mode == "5":
             st.write(f"**OSDI Score:** {osdi}")
