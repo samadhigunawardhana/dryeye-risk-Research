@@ -1,4 +1,4 @@
-# app_ded_full.py  (light theme + readable stepper + worded OSDI answers)
+# app_dashboard_best.py  (light theme + readable stepper + worded OSDI answers)
 # Works with either:
 #   - 10-feature video-only model (engineered features), or
 #   - 5-feature model (4 video + osdi_score).

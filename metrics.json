@@ -64,5 +64,25 @@
     "ibr_gt0_2"
   ],
   "target_col": "risk_label",
-  "split_policy": "Stratified holdout 20%"
+  "split_policy": "Stratified holdout 20%",
+  "n_total": 600,
+  "n_train": 480,
+  "n_test": 120,
+  "class_distribution": {
+    "total": {
+      "High": 120,
+      "Low": 276,
+      "Medium": 204
+    },
+    "train": {
+      "High": 96,
+      "Low": 221,
+      "Medium": 163
+    },
+    "test": {
+      "High": 24,
+      "Low": 55,
+      "Medium": 41
+    }
+  }
 }
