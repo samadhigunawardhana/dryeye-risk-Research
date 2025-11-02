@@ -1,5 +1,5 @@
 # train_model_best.py
-# Goal: honest 75–89% accuracy (no OSDI leakage), one-shot training + explicit split counts + CM plot.
+
 
 import argparse, json, joblib, numpy as np, pandas as pd
 from typing import List, Tuple, Dict
@@ -9,7 +9,7 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 from sklearn.ensemble import HistGradientBoostingClassifier
 import matplotlib.pyplot as plt
 
-# Base features (DO NOT include 'osdi_score')
+# Base features 
 FEATURE_BASE: List[str] = [
     "blink_rate_bpm",
     "incomplete_blink_ratio",
@@ -139,7 +139,7 @@ def main(dataset_path: str, seeds: List[int], target_low: float, target_high: fl
     with open("metrics.json", "w") as f:
         json.dump(res, f, indent=2)
 
-    # === Console summary (easy to paste into your report) ===
+    # === Console summary ===
     print("\n=== FINAL CHOICE ===")
     print(f"Seed: {res['seed']}")
     print(f"Accuracy (test): {acc:.3f}")
